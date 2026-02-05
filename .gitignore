@@ -1,0 +1,17 @@
+# Ignore python cache
+__pycache__/
+*.py[cod]
+
+# Ignore data and models (usually too large for git, unless using LFS)
+data/*.db
+models/*.h5
+models/*.pkl
+
+# Ignore environment folders
+venv/
+env/
+.env
+
+# Ignore IDE settings
+.vscode/
+.idea/

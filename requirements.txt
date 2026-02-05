@@ -1,0 +1,7 @@
+numpy
+matplotlib
+scipy
+casadi
+tensorflow
+scikit-learn
+joblib
