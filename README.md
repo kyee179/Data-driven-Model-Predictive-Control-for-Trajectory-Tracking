@@ -35,7 +35,7 @@ It is recommended to use a virtual environment.
 pip install -r requirements.txt
 ```
 
-## usage
+## Usage
 
 ### Generate Training Data
 
