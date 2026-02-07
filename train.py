@@ -1,92 +1,59 @@
 import os
 import sqlite3
 import joblib
-import argparse
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Input
-from tensorflow.keras.metrics import MeanSquaredError
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
-# Import system definitions to know dimensions
-from src.system import System3D, System3DLinear, System2D
-
-
-def get_system(sys_type, dt=0.01):
-    if sys_type == "3d_kinematic":
-        return System3D(dt)
-    elif sys_type == "3d_linear":
-        return System3DLinear(dt)
-    elif sys_type == "2d":
-        return System2D(dt)
-    else:
-        raise ValueError(f"Unknown system: {sys_type}")
+# --- Configuration ---
+DB_PATH = os.path.join("data", "system_dynamics_3_2.db")
+MODELS_DIR = "models"
+MODEL_NAME = "mlp_model"
+EPOCHS = 50
+BATCH_SIZE = 16
 
 
-def load_data_from_db(db_path, system_type):
+def load_dataset(db_path):
+    """Loads and features-engineers data from SQLite."""
     if not os.path.exists(db_path):
         raise FileNotFoundError(
-            f"Database {db_path} not found. Run generate_data.py first."
+            f"Database not found at {db_path}. Run generate_data.py first."
         )
 
-    # 1. Determine columns based on system
-    system = get_system(system_type)
-    cols_x = [f"x{i}" for i in range(system.n_states)]
-    cols_u = [f"u{i}" for i in range(system.n_controls)]
-    cols_dx = [f"dx{i}" for i in range(system.n_states)]
-
-    all_cols = cols_x + cols_u + cols_dx
-    query_cols = ", ".join(all_cols)
-
-    # 2. Query DB
-    print(f"Loading data for {system_type} from {db_path}...")
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    # Fetch raw: x, y, theta, u_v, u_w | dx, dy, dtheta
+    cursor.execute(
+        "SELECT x, y, theta, u_velocity, u_angular, dx, dy, dtheta FROM dynamics_data"
+    )
+    data = np.array(cursor.fetchall())
+    conn.close()
 
-    try:
-        cursor.execute(f"SELECT {query_cols} FROM dynamics_data")
-        data = np.array(cursor.fetchall())
-    except sqlite3.OperationalError as e:
-        print(f"\nSQL Error: {e}")
-        print(f"Expected columns: {query_cols}")
-        print("Tip: Ensure generate_data.py was run with the same --system argument.\n")
-        raise
-    finally:
-        conn.close()
+    # Inputs: [x, y, theta, v, w] -> Transform theta -> [cos, sin]
+    x_pos = data[:, 0:2]  # x, y
+    theta = data[:, 2]
+    u_ctrl = data[:, 3:5]  # v, w
 
-    # 3. Split into Input (State+Control) and Output (Next State/Derivative)
-    nx = system.n_states
-    nu = system.n_controls
+    cos_theta = np.cos(theta)[:, None]
+    sin_theta = np.sin(theta)[:, None]
 
-    X_raw = data[:, :nx]  # States (x0, x1...)
-    U_raw = data[:, nx : nx + nu]  # Controls (u0, u1...)
-    Y_raw = data[:, nx + nu :]  # Targets (dx0, dx1...)
+    X = np.hstack((x_pos, cos_theta, sin_theta, u_ctrl))
+    y = data[:, 5:]
 
-    # 4. Feature Engineering (Crucial for Kinematic systems)
-    if system_type == "3d_kinematic":
-        # Transform theta (x2) into cos(theta) and sin(theta)
-        # x0, x1, x2 -> x0, x1, cos(x2), sin(x2)
-        theta = X_raw[:, 2]
-        X_features = np.column_stack(
-            (X_raw[:, 0], X_raw[:, 1], np.cos(theta), np.sin(theta))
-        )
-        # Concatenate with controls
-        Inputs = np.hstack((X_features, U_raw))
-    else:
-        # Linear or 2D systems usually don't need trig wrapping
-        Inputs = np.hstack((X_raw, U_raw))
-
-    return Inputs, Y_raw
+    return X, y
 
 
-def build_model(input_dim, output_dim):
+def build_mlp(input_dim, output_dim):
+    """Creates the Keras Sequential model."""
     model = Sequential(
         [
             Input(shape=(input_dim,)),
+            Dense(128, activation="relu"),
             Dense(64, activation="relu"),
-            Dense(64, activation="relu"),
+            Dense(32, activation="relu"),
             Dense(output_dim, activation="linear"),
         ]
     )
@@ -94,61 +61,61 @@ def build_model(input_dim, output_dim):
     return model
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--system",
-        type=str,
-        default="3d_kinematic",
-        help="System type: 3d_linear, 3d_kinematic, 2d",
+def save_artifacts_for_casadi(model, input_scaler, output_scaler, save_dir):
+    """
+    Saves model weights and scaler params as simple numpy arrays/dicts.
+    This allows CasADi to reconstruct the network math symbolically.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    model.save(os.path.join(save_dir, "mlp_model.h5"))
+    print(f"Saved Keras model to {save_dir}")
+
+    weights = [layer.get_weights()[0] for layer in model.layers]
+    biases = [layer.get_weights()[1] for layer in model.layers]
+
+    joblib.dump(weights, os.path.join(save_dir, "mlp_weights.pkl"))
+    joblib.dump(biases, os.path.join(save_dir, "mlp_biases.pkl"))
+
+    in_params = {"mean": input_scaler.mean_, "std": input_scaler.scale_}
+    out_params = {"mean": output_scaler.mean_, "std": output_scaler.scale_}
+
+    joblib.dump(in_params, os.path.join(save_dir, "input_scaler_params.pkl"))
+    joblib.dump(out_params, os.path.join(save_dir, "output_scaler_params.pkl"))
+    print("Saved weights and scalers for CasADi integration.")
+
+
+def main():
+    print("Loading data...")
+    X, y = load_dataset(DB_PATH)
+
+    input_scaler = StandardScaler()
+    output_scaler = StandardScaler()
+
+    X_norm = input_scaler.fit_transform(X)
+    y_norm = output_scaler.fit_transform(y)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_norm, y_norm, test_size=0.2, random_state=42
     )
-    parser.add_argument("--db", type=str, default="data/generated_data.db")
-    parser.add_argument("--epochs", type=int, default=20)
-    args = parser.parse_args()
 
-    MODEL_DIR = "models"
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    print("Training Model...")
+    model = build_mlp(input_dim=X_train.shape[1], output_dim=y_train.shape[1])
 
-    try:
-        # Load
-        X, y = load_data_from_db(args.db, args.system)
+    model.fit(
+        X_train,
+        y_train,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=0.2,
+        verbose=1,
+    )
 
-        # Normalize
-        input_scaler = StandardScaler()
-        output_scaler = StandardScaler()
+    mse = model.evaluate(X_test, y_test, verbose=0)[0]
+    print(f"Test MSE: {mse:.6f}")
 
-        X_norm = input_scaler.fit_transform(X)
-        y_norm = output_scaler.fit_transform(y)
+    save_artifacts_for_casadi(model, input_scaler, output_scaler, MODELS_DIR)
 
-        # Save Scalers (Important for inference later)
-        joblib.dump(
-            input_scaler, os.path.join(MODEL_DIR, f"{args.system}_input_scaler.pkl")
-        )
-        joblib.dump(
-            output_scaler, os.path.join(MODEL_DIR, f"{args.system}_output_scaler.pkl")
-        )
 
-        # Train/Test Split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_norm, y_norm, test_size=0.2
-        )
-
-        # Train
-        print(f"Training model with Input Dim: {X.shape[1]}, Output Dim: {y.shape[1]}")
-        model = build_model(X.shape[1], y.shape[1])
-        model.fit(
-            X_train,
-            y_train,
-            epochs=args.epochs,
-            batch_size=32,
-            validation_split=0.1,
-            verbose=1,
-        )
-
-        # Save
-        model_path = os.path.join(MODEL_DIR, f"{args.system}_model.h5")
-        model.save(model_path)
-        print(f"Model saved to {model_path}")
-
-    except Exception as e:
-        print(f"Error: {e}")
+if __name__ == "__main__":
+    main()

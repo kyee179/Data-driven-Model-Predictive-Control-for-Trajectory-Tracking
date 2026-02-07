@@ -1,109 +1,117 @@
 import casadi as ca
 import numpy as np
+import joblib
+import os
 
 
-class BaseSystem:
-    """
-    Base class that handles both Symbolic (for MPC) and Numeric (for Data Gen) dynamics.
-    """
+class RobotSystem:
+    """Base class for robot dynamics."""
 
-    def __init__(self, dt):
+    def __init__(self, dt: float = 0.1):
         self.dt = dt
-        self.nx = self.n_states
-        self.nu = self.n_controls
+        self.x_sym = ca.MX.sym("x", 3)  # [x, y, theta]
+        self.u_sym = ca.MX.sym("u", 2)  # [v, omega]
 
-        # 1. Define Symbolic Primitives (One time setup)
-        self.sym_x = ca.MX.sym("x", self.nx)
-        self.sym_u = ca.MX.sym("u", self.nu)
+        self.dynamics_func = self.get_dynamics_function()
 
-        # 2. Get Symbolic Expression from Child Class
-        self.sym_rhs = self.define_dynamics(self.sym_x, self.sym_u)
-
-        # 3. Create Numerical Function (Auto-compiled)
-        # This allows us to run the EXACT same math in Python loops
-        self.f_numeric = ca.Function(
-            "f_dynamics", [self.sym_x, self.sym_u], [self.sym_rhs]
-        )
-
-    @property
-    def n_states(self):
+    def get_dynamics_function(self):
+        """Returns the CasADi function f(x, u) -> x_next."""
         raise NotImplementedError
 
-    @property
-    def n_controls(self):
-        raise NotImplementedError
+    def normalize_angle(self, theta):
+        """Symbolic angle normalization to [-pi, pi]."""
+        return (theta + ca.pi) % (2 * ca.pi) - ca.pi
 
-    def define_dynamics(self, x, u):
+    def step(
+        self, x_current: np.ndarray, u_current: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Must return a CasADi symbolic expression for x_dot.
-        Used by the MPC solver.
+        Computes the next state.
+        Returns: (x_next, dx_computed)
         """
-        raise NotImplementedError
+        res = self.dynamics_func(x_current, u_current)
+        x_next = np.array(res).flatten()
 
-    def compute_dx_numeric(self, x_val, u_val):
+        dx = (x_next - x_current) / self.dt
+
+        return x_next, dx
+
+
+class AnalyticalRobot(RobotSystem):
+    """
+    Physics-based kinematic model.
+    """
+
+    def get_dynamics_function(self):
+        dx = self.u_sym[0] * ca.cos(self.x_sym[2])
+        dy = self.u_sym[0] * ca.sin(self.x_sym[2])
+        dtheta = self.u_sym[1]
+
+        x_dot = ca.vertcat(dx, dy, dtheta)
+
+        x_next = self.x_sym + x_dot * self.dt
+
+        return ca.Function("analytical_step", [self.x_sym, self.u_sym], [x_next])
+
+
+class NeuralRobot(RobotSystem):
+    """
+    Data-driven model using an MLP approximated within CasADi.
+    Requires trained weights and scaler parameters in 'models/' directory.
+    """
+
+    def __init__(self, model_dir="models", dt=0.1):
+        self.model_dir = model_dir
+        self.weights = self._load_artifact("mlp_weights.pkl")
+        self.biases = self._load_artifact("mlp_biases.pkl")
+        self.input_scaler = self._load_artifact("input_scaler_params.pkl")
+        self.output_scaler = self._load_artifact("output_scaler_params.pkl")
+
+        super().__init__(dt)
+
+    def _load_artifact(self, filename):
+        path = os.path.join(self.model_dir, filename)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Model artifact not found: {path}. Run train.py first."
+            )
+        return joblib.load(path)
+
+    def _feature_engineering(self, x, u):
         """
-        Calculates the numerical derivative for simulation/data generation.
-        Input: Numpy arrays
-        Output: Numpy array (flattened)
+        Transforms raw state [x, y, theta] and control [v, w]
+        into network input features [x, y, cos(theta), sin(theta), v, w].
         """
-        # Convert inputs to CasADi compatible types (if needed) but Function handles numpy
-        res = self.f_numeric(x_val, u_val)
-        return np.array(res).flatten()
-
-
-# --- Concrete Implementations ---
-
-
-class System2D(BaseSystem):
-    @property
-    def n_states(self):
-        return 2
-
-    @property
-    def n_controls(self):
-        return 1
-
-    def define_dynamics(self, x, u):
-        dx1 = x[1]
-        dx2 = -x[0] + ca.sin(u[0])
-        return ca.vertcat(dx1, dx2)
-
-
-class System3D(BaseSystem):
-    """Standard Kinematic Car"""
-
-    @property
-    def n_states(self):
-        return 3
-
-    @property
-    def n_controls(self):
-        return 2
-
-    def define_dynamics(self, x, u):
         theta = x[2]
-        v = u[0]
-        w = u[1]
+        features = ca.vertcat(x[0], x[1], ca.cos(theta), ca.sin(theta), u[0], u[1])
+        return features
 
-        dx = v * ca.cos(theta)
-        dy = v * ca.sin(theta)
-        dtheta = w
-        return ca.vertcat(dx, dy, dtheta)
+    def get_dynamics_function(self):
+        input_features = self._feature_engineering(self.x_sym, self.u_sym)
 
+        in_mean = ca.MX(self.input_scaler["mean"])
+        in_std = ca.MX(self.input_scaler["std"])
+        norm_input = (input_features - in_mean) / in_std
 
-class System3DLinear(BaseSystem):
-    """Linear-like structure from your train.ipynb"""
+        layer_out = norm_input
 
-    @property
-    def n_states(self):
-        return 3
+        n_layers = len(self.weights)
 
-    @property
-    def n_controls(self):
-        return 2
+        for i in range(n_layers):
+            W = ca.MX(self.weights[i])
+            b = ca.MX(self.biases[i])
 
-    def define_dynamics(self, x, u):
-        dx = x[1]
-        dy = x[2] + u[0]
-        dz = -x[0] - 2 * x[1] - 3 * x[2] + u[1]
-        return ca.vertcat(dx, dy, dz)
+            layer_out = ca.mtimes(layer_out.T, W).T + b
+
+            if i < n_layers - 1:
+                layer_out = ca.fmax(0, layer_out)
+
+        out_mean = ca.MX(self.output_scaler["mean"])
+        out_std = ca.MX(self.output_scaler["std"])
+
+        delta_norm = layer_out
+        delta_state = (delta_norm * out_std) + out_mean
+
+        x_next = self.x_sym + delta_state * self.dt
+
+        return ca.Function("neural_step", [self.x_sym, self.u_sym], [x_next])

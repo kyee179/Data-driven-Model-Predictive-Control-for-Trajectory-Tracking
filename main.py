@@ -1,89 +1,101 @@
 import numpy as np
-import argparse
-from src.control import MPCController
+import time
+
+# --- Engineering Modules ---
+from src.system import AnalyticalRobot, NeuralRobot
 from src.trajectory import TrajectoryGenerator
+from src.control import MPCController, MPCParams
 from src.visualization import Visualizer
-from src.system import System3D, System3DLinear, System2D
-
-# --- CONFIGURATION INTERFACE ---
-CONFIG = {
-    "dt": 0.05,
-    "horizon": 20,
-    "total_time": 50.0,
-    "system_type": "3d_kinematic",  # Change to '3d_kinematic' or '2d' as needed
-    "traj_type": "sin_cos",  # Change to 'circle' as needed
-}
-
-
-def get_system(sys_type, dt):
-    if sys_type == "3d_kinematic":
-        return System3D(dt)
-    elif sys_type == "3d_linear":
-        return System3DLinear(dt)
-    elif sys_type == "2d":
-        return System2D(dt)
-    else:
-        raise ValueError(f"Unknown system type: {sys_type}")
-
-
-def get_trajectory(traj_type, total_time, dt):
-    gen = TrajectoryGenerator()
-    if traj_type == "circle":
-        return gen.generate_circle_trajectory(total_time, dt)
-    elif traj_type == "sin_cos":
-        return gen.generate_sin_cos_trajectory(total_time, dt)
-    else:
-        raise ValueError(f"Unknown trajectory type: {traj_type}")
 
 
 def main():
-    # 1. Setup
-    dt = CONFIG["dt"]
-    system = get_system(CONFIG["system_type"], dt)
+    # ==========================
+    # 1. Configuration & Setup
+    # ==========================
+    DT = 0.05
+    TOTAL_TIME = 20.0  # Simulation duration
+    HORIZON = 25  # MPC Prediction Horizon
 
-    # Weights (Adjust dimensions based on system)
-    nx = system.n_states
-    nu = system.n_controls
-    Q = np.diag([10] * nx)
-    R = np.diag([0.1] * nu)  # Lowered R slightly for better tracking
+    # Define MPC Weights (Tuning Parameters)
+    Q = np.diag([10.0, 10.0, 1.0])  # State Cost: [x, y, theta]
+    R = np.diag([1, 1])  # Control Cost: [v, w]
+    P = np.diag([0.0, 0.0, 0.0])  # Terminal Cost
 
-    # 2. Generate Reference
-    ref_traj = get_trajectory(CONFIG["traj_type"], CONFIG["total_time"], dt)
+    # Initialize Parameters
+    mpc_params = MPCParams(Q=Q, R=R, P=P, dt=DT, horizon=HORIZON)
 
-    # 3. Initialize Controller
-    mpc = MPCController(system, Q, R, CONFIG["horizon"])
+    # Initialize Components
+    plant = AnalyticalRobot(dt=DT)
 
-    # 4. Simulation Loop
-    x_current = np.zeros(nx)
+    controller_model = NeuralRobot(dt=DT)
+    controller = MPCController(system=controller_model, params=mpc_params)
+
+    # ==========================
+    # 2. Trajectory Generation
+    # ==========================
+    print("Generating Reference Trajectory...")
+    full_ref_traj = TrajectoryGenerator.generate_circle(
+        total_time=TOTAL_TIME + (HORIZON * DT) + 5.0, dt=DT, radius=5.0, omega=0.3
+    )
+
+    # ==========================
+    # 3. Simulation Loop
+    # ==========================
+    print(f"Starting Simulation ({TOTAL_TIME}s)...")
+
+    # Initial State (Start at the first reference point)
+    x_current = full_ref_traj[0].copy()
+    x_pred_model = x_current.copy()
+
+    # Data logging
     x_history = [x_current]
     u_history = []
 
-    steps = len(ref_traj) - CONFIG["horizon"]
-    print(f"Running Simulation: {CONFIG['system_type']} | {CONFIG['traj_type']}")
+    start_time = time.time()
+    num_steps = int(TOTAL_TIME / DT)
 
-    for k in range(steps):
-        ref_window = ref_traj[k : k + CONFIG["horizon"]]
+    for k in range(num_steps):
+        error_correction = x_current - x_pred_model
+        ref_window = full_ref_traj[k : k + HORIZON]
 
-        # A. Solve MPC (Uses Symbolic Dynamics internally)
-        u_opt = mpc.solve(x_current, ref_window)
+        try:
+            u_opt, _ = controller.solve(
+                x_current, ref_window, error_correction=error_correction
+            )
+        except Exception as e:
+            print(f"MPC Solver failed at step {k}: {e}")
+            u_opt = np.array([0.0, 0.0])  # Safe fallback control
 
-        # B. Simulation Step (Uses Numeric Dynamics)
-        # FIX: Replaced .dynamics() with .compute_dx_numeric()
-        dx_val = system.compute_dx_numeric(x_current, u_opt)
+        x_next_real, _ = plant.step(x_current, u_opt)
+        x_next_model_guess, _ = controller_model.step(x_current, u_opt)
 
-        # Euler Integration
-        x_next = x_current + dt * dx_val
-        x_current = x_next
-
-        # Log
-        x_history.append(x_current)
         u_history.append(u_opt)
+        x_history.append(x_next_real)
 
-        if k % 50 == 0:
-            print(f"Step {k}/{steps}")
+        x_current = x_next_real
+        x_pred_model = x_next_model_guess
 
-    # 5. Visualize
-    Visualizer.plot_tracking(ref_traj, x_history, u_history, dt)
+        # Logging progress
+        if k % 20 == 0:
+            print(
+                f"Step {k:3d}/{num_steps} | State: {x_current[:2]} | Control: {u_opt}"
+            )
+
+    elapsed = time.time() - start_time
+    print(f"Simulation Complete. Time elapsed: {elapsed:.2f}s")
+
+    # ==========================
+    # 4. Visualization
+    # ==========================
+    print("Generating Plots...")
+    Visualizer.plot_simulation_results(
+        ref_traj=full_ref_traj[: len(x_history)],
+        x_history=x_history,
+        u_history=u_history,
+        dt=DT,
+        save_dir="results",
+    )
+    print("Done. Check the 'results' folder.")
 
 
 if __name__ == "__main__":
